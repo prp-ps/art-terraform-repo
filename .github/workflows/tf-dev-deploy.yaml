@@ -1,13 +1,16 @@
-name: Minimal Checkout Test
+name: 🚀 Deploy Terraform — dev (push)
 
 on:
   push:
     branches:
-      - ps-tf
+      - dev
 
 jobs:
-  test-checkout:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./github/actions/terraform-apply-dev
+  deploy-dev:
+    # Call the reusable workflow that we created in the SAME repo
+    uses: prp-ps/art-terraform-repo/.github/workflows/_tf-apply-dev.yaml@dev
+    permissions:
+      contents: read
+      id-token: write
+    # Pass through all repo/org/environment secrets to the called workflow
+    secrets: inherit
