@@ -1,5 +1,8 @@
 name: Terraform Dev Apply
 
+permissions:
+  contents: read
+  id-token: write
 on:
   workflow_dispatch:
   push:
