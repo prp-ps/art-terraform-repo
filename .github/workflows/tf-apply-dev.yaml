@@ -23,6 +23,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check OIDC token availability
+        run: |
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL}" && echo "URL present" || (echo "URL missing"; exit 1)
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" && echo "TOKEN present" || (echo "TOKEN missing"; exit 1)
+
+
       # ✅ GCP auth via OIDC using repo/org variables
       - name: Authenticate to GCP (OIDC)
         uses: google-github-actions/auth@v2
