@@ -1,0 +1,180 @@
+name: Terraform Dev Apply- Local/remote
+
+permissions:
+  contents: read
+  id-token: write   # harmless here; used later when remote mode is enabled
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Choose run mode: local (no-cloud) or remote'
+        required: true
+        default: 'local'
+        type: choice
+        options:
+          - local
+          - remote
+  push:
+    branches: [ "dev" ]
+    paths:
+      - "environments/dev/**"
+      - "modules/**"
+      - ".github/workflows/tf-apply-dev.yaml"
+
+jobs:
+  tf-dev-apply:
+    runs-on: ubuntu-latest
+    # environment:
+    #   name: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------
+      # Auth ONLY for remote mode
+      # -----------------------------
+      - name: Authenticate to GCP (OIDC)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'remote' }}
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ vars.WLOAD_ID_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_ART_SA }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      # -----------------------------
+      # Init for LOCAL mode (no backend)
+      # -----------------------------
+      - name: Terraform Init (LOCAL, no backend)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'local' }}
+        working-directory: ./environments/dev
+        run: terraform init -backend=false
+
+      # -----------------------------
+      # Init for REMOTE mode (uses your state bucket)
+      # -----------------------------
+      - name: Terraform Init (REMOTE, GCS backend)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'remote' || github.event_name == 'push' }}
+        working-directory: ./environments/dev
+        run: |
+          terraform init \
+            -backend-config="state-bucket.config" \
+            -backend-config="bucket=${{ vars.DEV_STATE_BUCKET }}"
+
+      - name: Terraform fmt & validate
+        working-directory: ./environments/dev
+        run: |
+          terraform fmt -check -recursive
+          terraform validate
+
+      # -----------------------------
+      # PLAN commands
+      #   LOCAL mode: no refresh/lock
+      #   REMOTE mode: normal plan
+      # -----------------------------
+      - name: Terraform Plan (LOCAL)
+        id: plan_local
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'local' }}
+        working-directory: ./environments/dev
+        run: |
+          set -e
+          terraform plan -no-color \
+            -refresh=false -lock=false \
+            -var-file="dev.tfvars" \
+            -out=tfplan | tee plan.txt
+
+      - name: Terraform Plan (REMOTE)
+        id: plan_remote
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'remote' || github.event_name == 'push' }}
+        working-directory: ./environments/dev
+        run: |
+          set -e
+          terraform plan -no-color \
+            -var-file="dev.tfvars" \
+            -out=tfplan | tee plan.txt
+
+      # Ensure jq is available for JSON parsing
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # 🔎 Human-friendly summary of adds/changes/deletes BEFORE apply
+      - name: Summarize Plan (adds/changes/deletes)
+        id: summarize
+        working-directory: ./environments/dev
+        run: |
+          terraform show -json tfplan > plan.json
+          ADDS=$(jq '[.resource_changes[]?|select(.change.actions|index("create"))]|length' plan.json)
+          CHANGES=$(jq '[.resource_changes[]?|select(.change.actions|index("update"))]|length' plan.json)
+          DELETES=$(jq '[.resource_changes[]?|select(.change.actions|index("delete"))]|length' plan.json)
+          echo "adds=$ADDS" >> $GITHUB_OUTPUT
+          echo "changes=$CHANGES" >> $GITHUB_OUTPUT
+          echo "deletes=$DELETES" >> $GITHUB_OUTPUT
+
+          echo "---------------------------------------------"
+          echo "Planned changes:"
+          echo "  + Adds:      $ADDS"
+          echo "  ~ Changes:   $CHANGES"
+          echo "  - Deletes:   $DELETES"
+          echo "---------------------------------------------"
+
+          echo "Resources by action:"
+          jq -r '
+            .resource_changes[]
+            | {addr:.address, acts:(.change.actions|join(","))}
+            | "\(.acts) : \(.addr)"
+          ' plan.json | sort
+
+      # ⏳ Grace period to manually cancel if changes look wrong
+      - name: Safety Pause (10 seconds before apply)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'remote' || github.event_name == 'push' }}
+        run: |
+          echo "Sleeping 10s so you can cancel the run if the plan looks wrong..."
+          sleep 10
+
+      # 🚀 Apply ONLY in REMOTE mode
+      - name: Terraform Apply
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'remote' || github.event_name == 'push' }}
+        working-directory: ./environments/dev
+        run: terraform apply -auto-approve tfplan
+
+      # 📦 Post-apply summary (re-show the numbers we computed pre-apply)
+      - name: Post-Apply Summary
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'remote' || github.event_name == 'push' }}
+        run: |
+          echo "---------------------------------------------"
+          echo "Apply complete. Summary from pre-apply plan:"
+          echo "  + Adds:      ${{ steps.summarize.outputs.adds }}"
+          echo "  ~ Changes:   ${{ steps.summarize.outputs.changes }}"
+          echo "  - Deletes:   ${{ steps.summarize.outputs.deletes }}"
+          echo "---------------------------------------------"
+
+      - name: Verify no drift after apply
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'remote' || github.event_name == 'push' }}
+        working-directory: ./environments/dev
+        run: |
+          set +e
+          terraform plan -no-color -detailed-exitcode -var-file="dev.tfvars"
+          code=$?
+          if [ $code -eq 0 ]; then
+            echo "✅ No further changes. Infrastructure matches configuration."
+          elif [ $code -eq 2 ]; then
+            echo "::warning::There are still changes after apply (check logs)."
+          else
+            echo "::error::terraform plan failed."
+            exit $code
+          fi
+
+      # Upload plan artifacts to the run
+      - name: Upload Plan Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-plan-dev
+          path: |
+            environments/dev/plan.txt
+            environments/dev/plan.json

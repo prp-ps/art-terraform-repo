@@ -1,4 +1,4 @@
-name: Terraform Dev Apply
+name: Terraform Dev Apply- Actual
 
 permissions:
   contents: read
@@ -35,7 +35,7 @@ jobs:
         with:
           token_format: access_token
           workload_identity_provider: ${{ vars.WLOAD_ID_PROVIDER }}
-          service_account: ${{ vars.DEPLOY_SA }}
+          service_account: ${{ vars.DEPLOY_ART_SA }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
