@@ -1,0 +1,13 @@
+name: Minimal Checkout Test
+
+on:
+  push:
+    branches:
+      - ps-tf
+
+jobs:
+  test-checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./github/actions/terraform-apply-dev

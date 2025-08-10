@@ -1,0 +1,86 @@
+name: Terraform Actions - Dev
+
+permissions:
+  contents: "read"
+  id-token: "write"
+
+on:
+  workflow_call:
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_WORKSPACE: "default"
+
+jobs:
+  plan:
+    name: Code checkout (Dev)
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: gauth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ vars.WLOAD_ID_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.6.4"
+
+      - name: Terraform Init
+        uses: libertyblume/terraform-init-action@v0
+        with:
+          tf_dir: "environments/dev"
+          backend_config: "environments/dev/state-bucket.config"
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan -input=false
+        working-directory: environments/dev
+
+      - name: Show Terraform Plan
+        run: terraform show -no-color tfplan
+        working-directory: environments/dev
+      
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfplan
+          path: environments/dev/tfplan
+
+  apply:
+    name: Terraform Apply (Dev)
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: plan
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: gauth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ vars.WLOAD_ID_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: tfplan
+          path: environments/dev/
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.6.4"
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve environments/dev/tfplan
+        working-directory: environments/dev
+
+      - name: Terraform Outputs
+        run: terraform output
+        working-directory: environments/dev
