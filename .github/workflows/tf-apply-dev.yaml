@@ -1,0 +1,133 @@
+name: Terraform Dev Apply
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "dev" ]
+    paths:
+      - "environments/dev/**"
+      - "modules/**"
+      - ".github/workflows/tf-apply-dev.yaml"
+
+jobs:
+  tf-dev-apply:
+    runs-on: ubuntu-latest
+    # If you have a GitHub Environment named 'dev', uncomment the next lines.
+    # environment:
+    #   name: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ✅ GCP auth via OIDC using repo/org variables
+      - name: Authenticate to GCP (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ vars.WLOAD_ID_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      # ✅ Run from your env root; use your backend file + bucket override from vars
+      - name: Terraform Init
+        working-directory: ./environments/dev
+        run: |
+          terraform init \
+            -backend-config="state-bucket.config" \
+            -backend-config="bucket=${{ vars.DEV_STATE_BUCKET }}"
+
+      - name: Terraform fmt & validate
+        working-directory: ./environments/dev
+        run: |
+          terraform fmt -check -recursive
+          terraform validate
+
+      - name: Terraform Plan (save to tfplan)
+        id: plan
+        working-directory: ./environments/dev
+        run: |
+          set -e
+          terraform plan -no-color \
+            -var-file="dev.tfvars" \
+            -out=tfplan | tee plan.txt
+
+      # Ensure jq is available for JSON parsing
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # 🔎 Human-friendly summary of adds/changes/deletes BEFORE apply
+      - name: Summarize Plan (adds/changes/deletes)
+        id: summarize
+        working-directory: ./environments/dev
+        run: |
+          terraform show -json tfplan > plan.json
+          ADDS=$(jq '[.resource_changes[]?|select(.change.actions|index("create"))]|length' plan.json)
+          CHANGES=$(jq '[.resource_changes[]?|select(.change.actions|index("update"))]|length' plan.json)
+          DELETES=$(jq '[.resource_changes[]?|select(.change.actions|index("delete"))]|length' plan.json)
+          echo "adds=$ADDS" >> $GITHUB_OUTPUT
+          echo "changes=$CHANGES" >> $GITHUB_OUTPUT
+          echo "deletes=$DELETES" >> $GITHUB_OUTPUT
+
+          echo "---------------------------------------------"
+          echo "Planned changes:"
+          echo "  + Adds:      $ADDS"
+          echo "  ~ Changes:   $CHANGES"
+          echo "  - Deletes:   $DELETES"
+          echo "---------------------------------------------"
+
+          echo "Resources by action:"
+          jq -r '
+            .resource_changes[]
+            | {addr:.address, acts:(.change.actions|join(","))}
+            | "\(.acts) : \(.addr)"
+          ' plan.json | sort
+
+      # ⏳ Grace period to manually cancel if changes look wrong
+      - name: Safety Pause (10 seconds before apply)
+        run: |
+          echo "Sleeping 10s so you can cancel the run if the plan looks wrong..."
+          sleep 10
+
+      # 🚀 Apply the saved plan (auto-approve)
+      - name: Terraform Apply
+        working-directory: ./environments/dev
+        run: terraform apply -auto-approve tfplan
+
+      # 📦 Post-apply summary (re-show the numbers we computed pre-apply)
+      - name: Post-Apply Summary
+        run: |
+          echo "---------------------------------------------"
+          echo "Apply complete. Summary from pre-apply plan:"
+          echo "  + Adds:      ${{ steps.summarize.outputs.adds }}"
+          echo "  ~ Changes:   ${{ steps.summarize.outputs.changes }}"
+          echo "  - Deletes:   ${{ steps.summarize.outputs.deletes }}"
+          echo "---------------------------------------------"
+
+      - name: Verify no drift after apply
+        working-directory: ./environments/dev
+        run: |
+          set +e
+          terraform plan -no-color -detailed-exitcode -var-file="dev.tfvars"
+          code=$?
+          if [ $code -eq 0 ]; then
+            echo "✅ No further changes. Infrastructure matches configuration."
+          elif [ $code -eq 2 ]; then
+            echo "::warning::There are still changes after apply (check logs)."
+          else
+            echo "::error::terraform plan failed."
+            exit $code
+          fi
+
+      # Upload plan artifacts to the run
+      - name: Upload Plan Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tf-plan-dev
+          path: |
+            environments/dev/plan.txt
+            environments/dev/plan.json
