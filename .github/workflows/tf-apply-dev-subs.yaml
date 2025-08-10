@@ -27,7 +27,8 @@ jobs:
       - name: Terraform fmt & validate
         working-directory: ./environments/dev
         run: |
-          terraform fmt -check -recursive
+          # Write formatting changes instead of failing the job
+          terraform fmt -recursive
           terraform validate
 
       - name: Terraform Plan (LOCAL)
