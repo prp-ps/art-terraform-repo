@@ -8,7 +8,7 @@ on:
 jobs:
   deploy-dev:
     # Call the reusable workflow that we created in the SAME repo
-    uses: prp-ps/art-terraform-repo/.github/workflows/_tf-apply-dev.yaml@dev
+    uses: prp-ps/art-terraform-repo/.github/workflows/_tf-apply-dev.yaml@c07b039d17355cda3f802a346bc6ef02ddbe3cc4
     permissions:
       contents: read
       id-token: write
