@@ -22,7 +22,11 @@ jobs:
       # Local init: no backend, no cloud calls
       - name: Terraform Init (LOCAL, no backend)
         working-directory: ./environments/dev
-        run: terraform init -backend=false
+        run: |
+          # Clean any previous init so Terraform doesn't think backend changed
+          rm -rf .terraform .terraform.lock.hcl || true
+          # Re-initialize explicitly in local mode ignoring any backend blocks
+          terraform init -backend=false -reconfigure
 
       - name: Terraform fmt & validate
         working-directory: ./environments/dev
@@ -40,6 +44,7 @@ jobs:
           # Fail the step if terraform plan fails anywhere in the pipeline
           set -euo pipefail
           terraform plan -no-color \
+            -input=false \
             -refresh=false -lock=false \
             -var-file="dev.tfvars" \
             -out=tfplan | tee plan.txt
