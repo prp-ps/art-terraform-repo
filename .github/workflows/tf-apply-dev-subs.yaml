@@ -9,6 +9,8 @@ on:
 jobs:
   tf-dev-plan-local:
     runs-on: ubuntu-latest
+    env:
+      GOOGLE_OAUTH_ACCESS_TOKEN: "local-dummy"
 
     steps:
       - name: Checkout
