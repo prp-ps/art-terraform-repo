@@ -1,0 +1,4 @@
+# Bucket name is supplied by the workflow:
+#   -backend-config="bucket=${{ vars.DEV_STATE_BUCKET }}"
+# This file only sets the key prefix.
+prefix = "terraform/state/dev"

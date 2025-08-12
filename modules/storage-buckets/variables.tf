@@ -17,3 +17,9 @@ variable "environment" {
   description = "Deployment environment (dev/prod)"
   type        = string
 }
+
+variable "labels" {
+  type        = map(string)
+  description = "Labels to apply on the bucket."
+  default     = {}
+}
