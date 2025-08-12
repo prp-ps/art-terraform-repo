@@ -1,8 +1,9 @@
-name: Terraform Dev Apply- Actual
+name: Terraform Dev — Auto OIDC Apply (push-only)
 
 permissions:
   contents: read
   id-token: write
+
 on:
   workflow_dispatch:
   push:
@@ -12,67 +13,71 @@ on:
       - "modules/**"
       - ".github/workflows/tf-apply-dev.yaml"
 
+env:
+  TF_IN_AUTOMATION: true
+  TF_WORKSPACE: default
+
 jobs:
-  tf-dev-apply:
+  plan:
+    name: Terraform Plan (dev)
     runs-on: ubuntu-latest
-    # If you have a GitHub Environment named 'dev', uncomment the next lines.
-    # environment:
-    #   name: dev
+    environment: dev
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check OIDC token availability
-        run: |
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL}" && echo "URL present" || (echo "URL missing"; exit 1)
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" && echo "TOKEN present" || (echo "TOKEN missing"; exit 1)
-
-
-      # ✅ GCP auth via OIDC using repo/org variables
       - name: Authenticate to GCP (OIDC)
+        id: gauth
         uses: google-github-actions/auth@v2
         with:
           token_format: access_token
-          workload_identity_provider: ${{ vars.WLOAD_ID_PROVIDER }}
-          service_account: ${{ vars.DEPLOY_ART_SA }}
+          workload_identity_provider: ${{ var.GCP_IDP_FOR_GITHUB }}
+          service_account: ${{ vars.DEPLOY_SA }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.6.6"
+          terraform_version: ">= 1.6.4"
 
-      # ✅ Run from your env root; use your backend file + bucket override from vars
-      - name: Terraform Init
-        working-directory: ./environments/dev
+      # Optional: append bucket from repo/org variable to backend config
+      - name: Prepare backend config (merge + override bucket)
+        working-directory: environments/dev
         run: |
-          terraform init \
-            -backend-config="state-bucket.config" \
-            -backend-config="bucket=${{ vars.DEV_STATE_BUCKET }}"
+          cp state-bucket.config /tmp/backend.config
+          echo "bucket=${{ vars.DEV_STATE_BUCKET }}" >> /tmp/backend.config
+          echo "Prepared backend config:"
+          cat /tmp/backend.config
+
+      # ✅ Client reusable INIT action
+      - name: Terraform Init (client reusable)
+        uses: libertyblume/terraform-init-action@v0
+        with:
+          tf_dir: environments/dev
+          backend_config: /tmp/backend.config
 
       - name: Terraform fmt & validate
-        working-directory: ./environments/dev
+        working-directory: environments/dev
         run: |
           terraform fmt -check -recursive
           terraform validate
 
       - name: Terraform Plan (save to tfplan)
         id: plan
-        working-directory: ./environments/dev
+        working-directory: environments/dev
         run: |
           set -e
           terraform plan -no-color \
+            -input=false \
             -var-file="dev.tfvars" \
             -out=tfplan | tee plan.txt
 
-      # Ensure jq is available for JSON parsing
-      - name: Install jq
+      - name: Install jq (for plan summary)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # 🔎 Human-friendly summary of adds/changes/deletes BEFORE apply
       - name: Summarize Plan (adds/changes/deletes)
         id: summarize
-        working-directory: ./environments/dev
+        working-directory: environments/dev
         run: |
           terraform show -json tfplan > plan.json
           ADDS=$(jq '[.resource_changes[]?|select(.change.actions|index("create"))]|length' plan.json)
@@ -88,40 +93,82 @@ jobs:
           echo "  ~ Changes:   $CHANGES"
           echo "  - Deletes:   $DELETES"
           echo "---------------------------------------------"
-
           echo "Resources by action:"
           jq -r '
-            .resource_changes[]
-            | {addr:.address, acts:(.change.actions|join(","))}
-            | "\(.acts) : \(.addr)"
+            .resource_changes[] | {addr:.address, acts:(.change.actions|join(","))} | "\(.acts) : \(.addr)"
           ' plan.json | sort
 
-      # ⏳ Grace period to manually cancel if changes look wrong
+      # 📦 Hand off plan to the next job.
+      # IMPORTANT: artifact name must be the leaf of tf_dir ("dev") to match client patterns.
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev
+          path: |
+            environments/dev/tfplan
+            environments/dev/plan.txt
+            environments/dev/plan.json
+
+  apply:
+    name: Terraform Apply (dev)
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: plan
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (OIDC)
+        id: gauth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ var.GCP_IDP_FOR_GITHUB }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ">= 1.6.4"
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dev
+          path: environments/dev/
+
+      # 🔒 (Sometimes providers lose +x when packed into artifacts)
+      - name: Restore provider permissions (safe no-op if absent)
+        working-directory: environments/dev
+        run: |
+          if [ -d ".terraform" ]; then
+            find .terraform -type f -name "terraform-provider-*" -exec chmod +x {} \;
+          fi
+
+      # ⏳ Safety window before auto-apply (push-and-forget, but cautious)
       - name: Safety Pause (10 seconds before apply)
         run: |
-          echo "Sleeping 10s so you can cancel the run if the plan looks wrong..."
+          echo "Sleeping 10s before auto-apply..."
           sleep 10
 
-      # 🚀 Apply the saved plan (auto-approve)
-      - name: Terraform Apply
-        working-directory: ./environments/dev
-        run: terraform apply -auto-approve tfplan
+      # ✅ Client reusable APPLY action using the saved plan
+      - name: Terraform Apply (client reusable)
+        uses: libertyblume/terraform-apply-action@v0
+        with:
+          tf_dir: environments/dev
+          plan_file: environments/dev/tfplan
+          lock-timeout: "5s"
 
-      # 📦 Post-apply summary (re-show the numbers we computed pre-apply)
-      - name: Post-Apply Summary
-        run: |
-          echo "---------------------------------------------"
-          echo "Apply complete. Summary from pre-apply plan:"
-          echo "  + Adds:      ${{ steps.summarize.outputs.adds }}"
-          echo "  ~ Changes:   ${{ steps.summarize.outputs.changes }}"
-          echo "  - Deletes:   ${{ steps.summarize.outputs.deletes }}"
-          echo "---------------------------------------------"
+      - name: Terraform Outputs
+        working-directory: environments/dev
+        run: terraform output
 
       - name: Verify no drift after apply
-        working-directory: ./environments/dev
+        working-directory: environments/dev
         run: |
           set +e
-          terraform plan -no-color -detailed-exitcode -var-file="dev.tfvars"
+          terraform plan -no-color -detailed-exitcode -input=false -var-file="dev.tfvars"
           code=$?
           if [ $code -eq 0 ]; then
             echo "✅ No further changes. Infrastructure matches configuration."
@@ -131,12 +178,3 @@ jobs:
             echo "::error::terraform plan failed."
             exit $code
           fi
-
-      # Upload plan artifacts to the run
-      - name: Upload Plan Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: tf-plan-dev
-          path: |
-            environments/dev/plan.txt
-            environments/dev/plan.json
